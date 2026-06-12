@@ -54,6 +54,7 @@ function extractTwbFromTwbx(buf) {
 
 const stripBrackets = (s) => (s || "").replace(/^\[|\]$/g, "");
 const stripQuotes = (s) => (s || "").replace(/^"|"$/g, "");
+const cleanIdent = (s) => (s || "").replace(/\[([^\]]+)\]/g, "$1");
 
 function parseWorkbook(xmlText, fileName) {
   const doc = new DOMParser().parseFromString(xmlText, "text/xml");
@@ -79,6 +80,14 @@ function parseWorkbook(xmlText, fileName) {
     const caption = ds.getAttribute("caption") || stripBrackets(name);
     const isParams = name === "Parameters";
 
+    // Named connections: map name → schema
+    const namedConnSchemas = {};
+    for (const nc of Array.from(ds.getElementsByTagName("named-connection"))) {
+      const ncName = nc.getAttribute("name");
+      const inner = Array.from(nc.childNodes).find((n) => n.tagName === "connection");
+      if (ncName && inner) namedConnSchemas[ncName] = inner.getAttribute("schema") || null;
+    }
+
     const connections = [];
     for (const c of Array.from(ds.getElementsByTagName("connection"))) {
       const cls = c.getAttribute("class");
@@ -88,7 +97,28 @@ function parseWorkbook(xmlText, fileName) {
         server: c.getAttribute("server") || null,
         dbname: c.getAttribute("dbname") || c.getAttribute("filename") || null,
         warehouse: c.getAttribute("warehouse") || null,
+        schema: c.getAttribute("schema") || null,
       });
+    }
+
+    // Relations: table references and custom SQL
+    const seenTables = new Set();
+    const tables = [];
+    const customSql = [];
+    for (const rel of Array.from(ds.getElementsByTagName("relation"))) {
+      const type = rel.getAttribute("type");
+      if (type === "table") {
+        const raw = rel.getAttribute("table") || "";
+        const table = cleanIdent(raw);
+        if (table && !seenTables.has(table)) {
+          seenTables.add(table);
+          tables.push(table);
+        }
+      } else if (type === "text") {
+        const query = (rel.textContent || "").trim();
+        const label = rel.getAttribute("name") || "Custom SQL";
+        if (query) customSql.push({ label, query });
+      }
     }
 
     let fieldCount = 0;
@@ -112,7 +142,7 @@ function parseWorkbook(xmlText, fileName) {
       if (formula) calcs.push({ name: colCaption, datasource: caption, datatype, formula });
     }
 
-    if (!isParams) datasources.push({ name, caption, connections, fieldCount });
+    if (!isParams) datasources.push({ name, caption, connections, fieldCount, tables, customSql });
   }
 
   const worksheets = [];
@@ -194,8 +224,17 @@ function printWorkbook(data) {
       for (const c of d.connections) {
         const label = (CONN_LABELS[c.class] || c.class).padEnd(18);
         const color = connColor(c.class);
-        const parts = [c.server, c.warehouse, c.dbname].filter(Boolean);
+        const parts = [c.server, c.warehouse, c.dbname, c.schema].filter(Boolean);
         console.log("      " + color(label) + chalk.dim(parts.join("  /  ") || "local"));
+      }
+      if (d.tables.length) {
+        console.log("      " + chalk.dim("tables:  " + d.tables.join("  ·  ")));
+      }
+      for (const sql of d.customSql) {
+        console.log("      " + chalk.bold.magenta("Custom SQL") + chalk.dim("  " + sql.label));
+        for (const line of sql.query.split("\n")) {
+          console.log("        " + chalk.dim(line));
+        }
       }
     }
   }
@@ -269,9 +308,18 @@ function printMigrationSummary(allData) {
   const extracts = new Map();
   const allCalcs = new Map();
   const otherConns = new Map();
+  const allTables = new Map();   // table → Set of workbooks
+  const allCustomSql = [];
 
   for (const { meta, datasources, calcs } of allData) {
     for (const ds of datasources) {
+      for (const table of ds.tables || []) {
+        if (!allTables.has(table)) allTables.set(table, new Set());
+        allTables.get(table).add(meta.fileName);
+      }
+      for (const sql of ds.customSql || []) {
+        allCustomSql.push({ ...sql, workbook: meta.fileName, datasource: ds.caption });
+      }
       for (const c of ds.connections) {
         const parts = [c.server, c.warehouse, c.dbname].filter(Boolean);
         const key = c.class + "::" + parts.join("/");
@@ -332,6 +380,29 @@ function printMigrationSummary(allData) {
     console.log("\n  " + chalk.bold("Other connections") + chalk.dim("  (" + otherConns.size + ")"));
     for (const [label, wbs] of otherConns) {
       console.log("    " + chalk.green("○") + "  " + label + chalk.dim("  ·  " + wbs.size + " workbook" + (wbs.size !== 1 ? "s" : "")));
+    }
+  }
+
+  // Source tables
+  if (allTables.size) {
+    console.log("\n  " + chalk.bold("Source tables referenced") + chalk.dim("  (" + allTables.size + " unique)"));
+    for (const [table, wbs] of allTables) {
+      const count = wbs.size;
+      console.log(
+        "    " + chalk.white(table) +
+        (count > 1 ? chalk.dim("  ·  " + count + " workbooks") : "")
+      );
+    }
+  }
+
+  // Custom SQL
+  if (allCustomSql.length) {
+    console.log("\n  " + chalk.bold("Custom SQL queries") + chalk.dim("  (" + allCustomSql.length + ")"));
+    for (const sql of allCustomSql) {
+      console.log("\n    " + chalk.bold.magenta(sql.label) + chalk.dim("  " + sql.datasource + "  ·  " + sql.workbook));
+      for (const line of sql.query.split("\n")) {
+        console.log("      " + chalk.dim(line));
+      }
     }
   }
 
