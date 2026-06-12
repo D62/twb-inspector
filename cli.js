@@ -56,6 +56,15 @@ const stripBrackets = (s) => (s || "").replace(/^\[|\]$/g, "");
 const stripQuotes = (s) => (s || "").replace(/^"|"$/g, "");
 const cleanIdent = (s) => (s || "").replace(/\[([^\]]+)\]/g, "$1");
 
+// xmldom textContent doesn't always recurse through CDATA nodes
+function nodeText(node) {
+  if (!node) return "";
+  if (node.nodeType === 3 || node.nodeType === 4) return node.nodeValue || "";
+  let t = "";
+  for (const child of Array.from(node.childNodes || [])) t += nodeText(child);
+  return t;
+}
+
 function parseWorkbook(xmlText, fileName) {
   const doc = new DOMParser().parseFromString(xmlText, "text/xml");
 
@@ -115,7 +124,7 @@ function parseWorkbook(xmlText, fileName) {
           tables.push(table);
         }
       } else if (type === "text") {
-        const query = (rel.textContent || "").trim();
+        const query = nodeText(rel).trim() || (rel.getAttribute("query") || "").trim();
         const label = rel.getAttribute("name") || "Custom SQL";
         if (query) customSql.push({ label, query });
       }
@@ -231,10 +240,12 @@ function printWorkbook(data) {
         console.log("      " + chalk.dim("tables:  " + d.tables.join("  ·  ")));
       }
       for (const sql of d.customSql) {
-        console.log("      " + chalk.bold.magenta("Custom SQL") + chalk.dim("  " + sql.label));
+        console.log("\n      " + chalk.bold.magenta("Custom SQL") + "  " + chalk.dim(sql.label));
+        console.log("      " + chalk.dim("┌" + "─".repeat(56)));
         for (const line of sql.query.split("\n")) {
-          console.log("        " + chalk.dim(line));
+          console.log("      " + chalk.dim("│ ") + chalk.white(line));
         }
+        console.log("      " + chalk.dim("└" + "─".repeat(56)));
       }
     }
   }
@@ -399,10 +410,12 @@ function printMigrationSummary(allData) {
   if (allCustomSql.length) {
     console.log("\n  " + chalk.bold("Custom SQL queries") + chalk.dim("  (" + allCustomSql.length + ")"));
     for (const sql of allCustomSql) {
-      console.log("\n    " + chalk.bold.magenta(sql.label) + chalk.dim("  " + sql.datasource + "  ·  " + sql.workbook));
+      console.log("\n    " + chalk.bold.magenta(sql.label) + "  " + chalk.dim(sql.datasource + "  ·  " + sql.workbook));
+      console.log("    " + chalk.dim("┌" + "─".repeat(56)));
       for (const line of sql.query.split("\n")) {
-        console.log("      " + chalk.dim(line));
+        console.log("    " + chalk.dim("│ ") + chalk.white(line));
       }
+      console.log("    " + chalk.dim("└" + "─".repeat(56)));
     }
   }
 
