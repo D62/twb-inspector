@@ -32,6 +32,10 @@ node cli.js ./workbooks/
 
 # JSON output (pipe to jq, save to file, etc.)
 node cli.js ./workbooks/ --json > inventory.json
+
+# export Markdown reports to out/  (one file per workbook + a summary for folders)
+node cli.js workbook.twb --export
+node cli.js ./workbooks/ --export
 ```
 
 ## What it shows
