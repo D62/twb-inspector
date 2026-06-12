@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from "node:fs";
 import { inflateRawSync } from "node:zlib";
 import { basename, join, extname } from "node:path";
 import { DOMParser } from "@xmldom/xmldom";
@@ -424,6 +424,205 @@ function printMigrationSummary(allData) {
   console.log();
 }
 
+// ─── Markdown export ─────────────────────────────────────────────────────────
+
+function mdWorkbook(data) {
+  const { meta, datasources, worksheets, dashboards, calcs, parameters } = data;
+  const lines = [];
+
+  lines.push(`# ${meta.fileName}`);
+  lines.push(`**Version:** ${meta.version}${meta.build ? `  ·  **Build:** ${meta.build}` : ""}`);
+
+  // Data sources
+  lines.push("\n---\n\n## Data Sources");
+  if (!datasources.length) {
+    lines.push("_none_");
+  } else {
+    for (const d of datasources) {
+      lines.push(`\n### ${d.caption}  *(${d.fieldCount} fields)*`);
+      for (const c of d.connections) {
+        const parts = [c.server, c.warehouse, c.dbname, c.schema].filter(Boolean);
+        lines.push(`**Connection:** ${CONN_LABELS[c.class] || c.class}${parts.length ? " — " + parts.join(" / ") : ""}`);
+      }
+      if (d.tables.length) {
+        lines.push("\n**Tables:**");
+        for (const t of d.tables) lines.push(`- \`${t}\``);
+      }
+      for (const sql of d.customSql) {
+        lines.push(`\n**Custom SQL** — *${sql.label}*`);
+        lines.push("```sql\n" + sql.query + "\n```");
+      }
+    }
+  }
+
+  // Worksheets
+  lines.push("\n---\n\n## Worksheets");
+  if (!worksheets.length) {
+    lines.push("_none_");
+  } else {
+    lines.push("\n| Sheet | Data Sources |");
+    lines.push("|---|---|");
+    for (const w of worksheets) {
+      lines.push(`| ${w.name} | ${w.datasources.join(", ") || "—"} |`);
+    }
+  }
+
+  // Dashboards
+  lines.push("\n---\n\n## Dashboards");
+  if (!dashboards.length) {
+    lines.push("_none_");
+  } else {
+    for (const d of dashboards) {
+      lines.push(`\n### ${d.name}`);
+      if (d.sheets.length) lines.push(d.sheets.map((s) => `- ${s}`).join("\n"));
+    }
+  }
+
+  // Calculated fields
+  lines.push("\n---\n\n## Calculated Fields");
+  if (!calcs.length) {
+    lines.push("_none_");
+  } else {
+    for (const c of calcs) {
+      lines.push(`\n### ${c.name}`);
+      lines.push(`**Source:** ${c.datasource}${c.datatype ? `  ·  \`${c.datatype}\`` : ""}`);
+      lines.push("```\n" + c.formula + "\n```");
+    }
+  }
+
+  // Parameters
+  lines.push("\n---\n\n## Parameters");
+  if (!parameters.length) {
+    lines.push("_none_");
+  } else {
+    lines.push("\n| Name | Type | Default |");
+    lines.push("|---|---|---|");
+    for (const p of parameters) {
+      lines.push(`| ${p.name} | ${p.datatype || "—"} | ${stripQuotes(p.value) || "—"} |`);
+    }
+  }
+
+  lines.push("");
+  return lines.join("\n");
+}
+
+function mdSummary(allData) {
+  const lines = [];
+  const n = allData.length;
+
+  lines.push("# Inventory Summary");
+  lines.push(`${n} workbook${n !== 1 ? "s" : ""}  ·  ` +
+    `${allData.reduce((s, d) => s + d.worksheets.length, 0)} sheets  ·  ` +
+    `${allData.reduce((s, d) => s + d.dashboards.length, 0)} dashboards`
+  );
+
+  // Unique connections
+  const conns = new Map();
+  const extracts = new Map();
+  const allTables = new Map();
+  const allCustomSql = [];
+  const allCalcs = new Map();
+
+  for (const { meta, datasources, calcs } of allData) {
+    for (const ds of datasources) {
+      for (const t of ds.tables || []) {
+        if (!allTables.has(t)) allTables.set(t, new Set());
+        allTables.get(t).add(meta.fileName);
+      }
+      for (const sql of ds.customSql || []) {
+        allCustomSql.push({ ...sql, workbook: meta.fileName, datasource: ds.caption });
+      }
+      for (const c of ds.connections) {
+        const parts = [c.server, c.warehouse, c.dbname, c.schema].filter(Boolean);
+        const key = c.class + "::" + parts.join("/");
+        if (c.class === "hyper") {
+          const label = c.dbname || c.server || "(unknown)";
+          if (!extracts.has(label)) extracts.set(label, new Set());
+          extracts.get(label).add(meta.fileName);
+        } else {
+          if (!conns.has(key)) conns.set(key, { class: c.class, parts, workbooks: new Set() });
+          conns.get(key).workbooks.add(meta.fileName);
+        }
+      }
+    }
+    for (const c of calcs) {
+      if (!allCalcs.has(c.name)) allCalcs.set(c.name, { formula: c.formula, datasource: c.datasource, workbooks: new Set() });
+      allCalcs.get(c.name).workbooks.add(meta.fileName);
+    }
+  }
+
+  lines.push("\n---\n\n## Connections");
+  if (conns.size) {
+    lines.push("\n| Type | Server / Warehouse / Database / Schema | Workbooks |");
+    lines.push("|---|---|---|");
+    for (const [, info] of conns) {
+      lines.push(`| ${CONN_LABELS[info.class] || info.class} | ${info.parts.join(" / ")} | ${[...info.workbooks].join(", ")} |`);
+    }
+  } else {
+    lines.push("_none_");
+  }
+
+  lines.push("\n---\n\n## Extracts");
+  if (extracts.size) {
+    lines.push("\n| File | Workbooks |");
+    lines.push("|---|---|");
+    for (const [label, wbs] of extracts) {
+      lines.push(`| ${label} | ${[...wbs].join(", ")} |`);
+    }
+  } else {
+    lines.push("_none_");
+  }
+
+  lines.push("\n---\n\n## Source Tables");
+  if (allTables.size) {
+    lines.push("\n| Table | Workbooks |");
+    lines.push("|---|---|");
+    for (const [table, wbs] of allTables) {
+      lines.push(`| \`${table}\` | ${[...wbs].join(", ")} |`);
+    }
+  } else {
+    lines.push("_none_");
+  }
+
+  if (allCustomSql.length) {
+    lines.push("\n---\n\n## Custom SQL Queries");
+    for (const sql of allCustomSql) {
+      lines.push(`\n### ${sql.label}`);
+      lines.push(`**Workbook:** ${sql.workbook}  ·  **Data source:** ${sql.datasource}`);
+      lines.push("```sql\n" + sql.query + "\n```");
+    }
+  }
+
+  lines.push("\n---\n\n## Calculated Fields");
+  if (allCalcs.size) {
+    for (const [name, info] of allCalcs) {
+      lines.push(`\n### ${name}`);
+      lines.push(`**Source:** ${info.datasource}  ·  **Used in:** ${[...info.workbooks].join(", ")}`);
+      lines.push("```\n" + info.formula + "\n```");
+    }
+  } else {
+    lines.push("_none_");
+  }
+
+  lines.push("");
+  return lines.join("\n");
+}
+
+function timestamp() {
+  return new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15);
+}
+
+function exportSlug(fileName) {
+  return fileName.replace(/\.(twbx?)$/i, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function writeExport(content, slug, outDir) {
+  mkdirSync(outDir, { recursive: true });
+  const path = join(outDir, `${slug}_${timestamp()}.md`);
+  writeFileSync(path, content, "utf8");
+  return path;
+}
+
 // ─── File discovery ───────────────────────────────────────────────────────────
 
 function collectFiles(pathArg) {
@@ -452,10 +651,12 @@ function loadFile(filePath) {
 
 const args = process.argv.slice(2);
 const jsonFlag = args.includes("--json");
+const exportFlag = args.includes("--export");
+const outDir = "out";
 const paths = args.filter((a) => !a.startsWith("-"));
 
 if (!paths.length) {
-  console.error(chalk.red("Usage:") + "  node cli.js <file.twb|file.twbx|directory> [--json]");
+  console.error(chalk.red("Usage:") + "  node cli.js <file.twb|file.twbx|directory> [--json] [--export]");
   process.exit(1);
 }
 
@@ -480,4 +681,15 @@ if (jsonFlag) {
 } else {
   for (const data of results) printWorkbook(data);
   if (results.length > 1) printMigrationSummary(results);
+}
+
+if (exportFlag) {
+  for (const data of results) {
+    const path = writeExport(mdWorkbook(data), exportSlug(data.meta.fileName), outDir);
+    console.log(chalk.dim("exported  ") + path);
+  }
+  if (results.length > 1) {
+    const path = writeExport(mdSummary(results), "_summary", outDir);
+    console.log(chalk.dim("exported  ") + path);
+  }
 }
